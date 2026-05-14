@@ -37,7 +37,12 @@ echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
 cd test_env
-pip install torch numpy
+# Pin torch below 2.12 to match the EP_TORCH_VERSIONS the wheel is
+# built for (currently "2.9.0;2.9.1;2.10.0;2.11.0" — see ci.yml). When
+# torch 2.12.0 was released, the unpinned `pip install torch` started
+# pulling a version the wheel doesn't ship a mooncake.pg_X_Y_Z module
+# for, breaking `from mooncake import pg`.
+pip install 'torch<2.12' numpy
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."

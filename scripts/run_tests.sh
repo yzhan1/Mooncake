@@ -40,7 +40,10 @@ DUMMY_TEST_PID_2=$!
 wait $DUMMY_TEST_PID_1 $DUMMY_TEST_PID_2
 kill $CLIENT_PID || true
 
-pip install torch numpy safetensors packaging
+# Pin torch below 2.12 to match the wheel's EP_TORCH_VERSIONS list
+# ("2.9.0;2.9.1;2.10.0;2.11.0"). See scripts/test_installation.sh for
+# the full rationale.
+pip install 'torch<2.12' numpy safetensors packaging
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 kill $MASTER_PID || true
