@@ -98,6 +98,12 @@ struct MasterConfig {
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+
+    // Promotion-on-hit: when Get observes a LOCAL_DISK-only key, queue an
+    // async copy back to MEMORY so the next Get is fast.
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
 };
 
 class MasterServiceSupervisorConfig {
@@ -159,6 +165,9 @@ class MasterServiceSupervisorConfig {
     bool enable_cxl = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -176,6 +185,9 @@ class MasterServiceSupervisorConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -288,6 +300,9 @@ class WrappedMasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -345,6 +360,9 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -424,6 +442,9 @@ class WrappedMasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
@@ -761,6 +782,9 @@ class MasterServiceConfig {
     bool enable_offload = false;
     bool offload_on_evict = false;
     bool offload_force_evict = false;
+    bool promotion_on_hit = false;
+    uint32_t promotion_admission_threshold = 2;
+    uint32_t promotion_queue_limit = 50000;
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -814,6 +838,9 @@ class MasterServiceConfig {
         enable_offload = config.enable_offload;
         offload_on_evict = config.offload_on_evict;
         offload_force_evict = config.offload_force_evict;
+        promotion_on_hit = config.promotion_on_hit;
+        promotion_admission_threshold = config.promotion_admission_threshold;
+        promotion_queue_limit = config.promotion_queue_limit;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         cluster_id = config.cluster_id;
