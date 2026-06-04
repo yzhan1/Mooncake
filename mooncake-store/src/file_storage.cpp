@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
+#include "local_disk_marker.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
@@ -216,6 +217,21 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                    << register_memory_result.error();
         return register_memory_result;
     }
+
+    // Resolve persistent storage identity from the marker file before
+    // touching the backend. If the marker is missing and data is present,
+    // auto-migrate (unless strict-mode env var is set). See RFC §4.
+    auto marker_result = ResolveLocalDiskSegmentId(config_.storage_filepath);
+    if (!marker_result) {
+        LOG(ERROR) << "Failed to resolve local_disk_segment_id: "
+                   << marker_result.error();
+        return tl::make_unexpected(marker_result.error());
+    }
+    local_disk_segment_id_ = marker_result.value();
+    LOG(INFO) << "local_disk_segment_id="
+              << UuidToString(local_disk_segment_id_)
+              << ", storage_filepath=" << config_.storage_filepath;
+
     auto init_storage_backend_result = storage_backend_->Init();
     if (!init_storage_backend_result) {
         LOG(ERROR) << "Failed to init storage backend: "
@@ -238,12 +254,27 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
-        auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
-        if (!mount_file_storage_result) {
-            LOG(ERROR) << "Failed to mount file storage: "
-                       << mount_file_storage_result.error();
-            return mount_file_storage_result;
+        // Use warm-aware mount: pass the persistent local_disk_segment_id
+        // from the marker file so the master can re-attach existing replicas
+        // (RFC §5). Falls back gracefully when the master is too old to
+        // recognise the new RPC.
+        auto mount_result = client_->MountLocalDiskSegmentWithIdentity(
+            local_disk_segment_id_, local_rpc_addr_, enable_offloading_);
+        if (!mount_result) {
+            // Backward compat: try the legacy mount RPC. Old masters don't
+            // know about MountLocalDiskSegmentWithIdentity; in mixed-version
+            // deployments we want the client to still come up (no warm
+            // re-adoption benefit, but no regression).
+            LOG(WARNING) << "MountLocalDiskSegmentWithIdentity failed (error="
+                         << mount_result.error()
+                         << "); falling back to legacy MountLocalDiskSegment. "
+                         << "Warm re-adoption disabled for this client.";
+            auto legacy = client_->MountLocalDiskSegment(enable_offloading_);
+            if (!legacy) {
+                LOG(ERROR) << "Failed to mount file storage: "
+                           << legacy.error();
+                return legacy;
+            }
         }
     }
     // Report configured SSD capacity to Master so it can populate

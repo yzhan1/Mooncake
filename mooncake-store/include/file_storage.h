@@ -121,6 +121,10 @@ class FileStorage {
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
+    // Persistent storage identity read from the marker file at the
+    // configured storage_filepath. Populated by Init() before the first
+    // MountLocalDiskSegment RPC. Used for warm re-adoption (RFC §4).
+    UUID local_disk_segment_id_{};
     // Pinned host memory pool for GPU D2H staging in OffloadObjects
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;

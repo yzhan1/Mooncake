@@ -2429,6 +2429,26 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     return response;
 }
 
+tl::expected<std::pair<uint8_t, uint64_t>, ErrorCode>
+Client::MountLocalDiskSegmentWithIdentity(const UUID& local_disk_segment_id,
+                                          const std::string& transport_endpoint,
+                                          bool enable_offloading) {
+    auto response = master_client_.MountLocalDiskSegmentWithIdentity(
+        client_id_, local_disk_segment_id, transport_endpoint,
+        enable_offloading);
+    if (!response) {
+        LOG(ERROR) << "MountLocalDiskSegmentWithIdentity failed, error code="
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    LOG(INFO) << "MountLocalDiskSegmentWithIdentity success"
+              << ", outcome="
+              << (response.value().first == 0 ? "fresh_mount" : "reattached")
+              << ", adopted_count=" << response.value().second;
+    EnsureStorageControlPlaneStarted();
+    return response;
+}
+
 tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     bool enable_offloading,
     std::unordered_map<std::string, int64_t>& offloading_objects) {

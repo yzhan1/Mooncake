@@ -1754,6 +1754,31 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     return result;
 }
 
+tl::expected<std::pair<uint8_t, uint64_t>, ErrorCode>
+WrappedMasterService::MountLocalDiskSegmentWithIdentity(
+    const UUID& client_id, const UUID& local_disk_segment_id,
+    const std::string& transport_endpoint, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MountLocalDiskSegmentWithIdentity");
+    timer.LogRequest("action=mount_local_disk_segment_with_identity");
+    LOG(INFO) << "Mount LOCAL_DISK with identity"
+              << ", client_id=" << client_id
+              << ", local_disk_segment_id=" << local_disk_segment_id
+              << ", enable_offloading=" << enable_offloading;
+    auto result = master_service_.MountLocalDiskSegmentWithIdentity(
+        client_id, local_disk_segment_id, transport_endpoint,
+        enable_offloading);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
+    // Marshal {outcome, adopted_count} as a pair of POD-friendly types so
+    // YLT's reflection can serialize over the wire without exposing the
+    // master-internal MountOutcome enum.
+    std::pair<uint8_t, uint64_t> wire{
+        static_cast<uint8_t>(result.value().first),
+        static_cast<uint64_t>(result.value().second)};
+    return wire;
+}
+
 tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>,
              ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
@@ -1935,6 +1960,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::MountLocalDiskSegmentWithIdentity>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(

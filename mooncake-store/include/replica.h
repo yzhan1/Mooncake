@@ -5,6 +5,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -178,6 +179,24 @@ struct LocalDiskDescriptor {
     uint64_t object_size = 0;
     std::string transport_endpoint;
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+};
+
+// LOCAL_DISK liveness lifecycle, orthogonal to ReplicaStatus.
+// In-memory only on MasterService; never serialized to snapshot/oplog.
+enum class LocalDiskReplicaState : uint8_t {
+    OK,            // owner client alive and heartbeating
+    DISCONNECTED,  // owner unreachable; grace timer running; awaiting
+                   // same-identity reattach
+    REMOVED        // grace expired; data unclaimable; entry erased by reaper
+};
+
+// Per-replica sidecar carrying liveness state and the persistent identity
+// (local_disk_segment_id) read from the client's marker file. Kept on
+// MasterService in a map keyed by ReplicaID; never serialized.
+struct LocalDiskRuntime {
+    UUID local_disk_segment_id{};
+    LocalDiskReplicaState state{LocalDiskReplicaState::OK};
+    std::optional<std::chrono::system_clock::time_point> grace_expiry{};
 };
 
 class Replica {
@@ -386,6 +405,21 @@ class Replica {
             return disk_data.client_id;
         }
         return std::nullopt;
+    }
+
+    /**
+     * @brief Re-bind a LOCAL_DISK replica to a new owner client + transport
+     * endpoint. Used during warm re-adoption when a returning client claims
+     * its persistent storage via matching local_disk_segment_id (RFC §5).
+     * No-op for non-LOCAL_DISK replicas.
+     */
+    void set_local_disk_owner(const UUID& new_client_id,
+                              const std::string& new_transport_endpoint) {
+        if (is_local_disk_replica()) {
+            auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+            disk_data.client_id = new_client_id;
+            disk_data.transport_endpoint = new_transport_endpoint;
+        }
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {

@@ -218,6 +218,11 @@ struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegmentWithIdentity> {
+    static constexpr const char* value = "MountLocalDiskSegmentWithIdentity";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
     static constexpr const char* value = "OffloadObjectHeartbeat";
 };
@@ -911,6 +916,23 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
             client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::pair<uint8_t, uint64_t>, ErrorCode>
+MasterClient::MountLocalDiskSegmentWithIdentity(
+    const UUID& client_id, const UUID& local_disk_segment_id,
+    const std::string& transport_endpoint, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegmentWithIdentity");
+    timer.LogRequest("client_id=", client_id,
+                     ", local_disk_segment_id=", local_disk_segment_id,
+                     ", enable_offloading=", enable_offloading);
+    auto result =
+        invoke_rpc<&WrappedMasterService::MountLocalDiskSegmentWithIdentity,
+                   std::pair<uint8_t, uint64_t>>(
+            client_id, local_disk_segment_id, transport_endpoint,
+            enable_offloading);
     timer.LogResponseExpected(result);
     return result;
 }

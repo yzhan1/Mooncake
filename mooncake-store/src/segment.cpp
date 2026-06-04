@@ -319,6 +319,14 @@ ErrorCode ScopedSegmentAccess::GetClientSegments(
     return ErrorCode::OK;
 }
 
+void ScopedSegmentAccess::GetAllClientIds(std::vector<UUID>& client_ids) const {
+    client_ids.clear();
+    client_ids.reserve(segment_manager_->client_segments_.size());
+    for (const auto& [cid, _segs] : segment_manager_->client_segments_) {
+        client_ids.push_back(cid);
+    }
+}
+
 void ScopedSegmentAccess::UnmountLocalDiskSegment(const UUID& client_id) {
     auto it = segment_manager_->client_local_disk_segment_.find(client_id);
     if (it != segment_manager_->client_local_disk_segment_.end()) {

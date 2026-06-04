@@ -396,6 +396,17 @@ class Client {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
     /**
+     * @brief Warm re-adoption mount (RFC §5). Passes the persistent
+     * local_disk_segment_id from the marker file. If the master finds an
+     * existing entry with the same marker, it atomically re-binds those
+     * replicas to this client. Returns {outcome_byte, adopted_count}.
+     */
+    tl::expected<std::pair<uint8_t, uint64_t>, ErrorCode>
+    MountLocalDiskSegmentWithIdentity(const UUID& local_disk_segment_id,
+                                      const std::string& transport_endpoint,
+                                      bool enable_offloading);
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
