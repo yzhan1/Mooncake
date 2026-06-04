@@ -53,6 +53,10 @@ class SnapshotChildProcessTest;
 // standing up a full snapshot catalog + child-process harness, and
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
+// Friended so the disconnect/warm-readoption tests can inspect the
+// LOCAL_DISK sidecar state and drive ResetStateAfterFailedRestoreAttempt
+// to simulate leader failover without standing up a full HA harness.
+class LocalDiskDisconnectTest;
 }  // namespace test
 
 /*
@@ -67,6 +71,7 @@ class MasterService {
     friend class test::MasterServiceSnapshotTestBase;
     friend class test::SnapshotChildProcessTest;
     friend class test::PromotionOnHitTest;
+    friend class test::LocalDiskDisconnectTest;
 
    public:
     using NoFProbeFn =
@@ -509,6 +514,27 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Outcome of a warm-aware LOCAL_DISK mount.
+     * - FreshMount        : no prior data found for this marker; mounted as new
+     * - Reattached        : prior data found and re-bound to (client_id, te)
+     */
+    enum class MountOutcome : uint8_t { FreshMount, Reattached };
+
+    /**
+     * @brief LOCAL_DISK mount that carries the persistent storage identity
+     * (local_disk_segment_id) from the client's marker file (RFC §5).
+     * If the marker matches replicas previously owned by another client_id,
+     * those replicas are atomically re-bound to (client_id, transport_endpoint)
+     * and their sidecar state is flipped DISCONNECTED→OK. Otherwise behaves
+     * like a normal MountLocalDiskSegment.
+     * @return {outcome, adopted_replica_count}.
+     */
+    auto MountLocalDiskSegmentWithIdentity(
+        const UUID& client_id, const UUID& local_disk_segment_id,
+        const std::string& transport_endpoint, bool enable_offloading)
+        -> tl::expected<std::pair<MountOutcome, size_t>, ErrorCode>;
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -705,6 +731,13 @@ class MasterService {
     // evict_ratio_lowerbound, the second pass will be triggered and try to
     // fulfill evict ratio lowerbound.
     void BatchEvict(double evict_ratio_target, double evict_ratio_lowerbound);
+
+    // Reader visibility predicate for the LOCAL_DISK warm re-adoption feature.
+    // Removes from replica_list any LOCAL_DISK replica whose sidecar runtime
+    // state is not OK (i.e., DISCONNECTED or REMOVED). Non-LOCAL_DISK replicas
+    // are untouched.
+    void FilterDisconnectedLocalDiskReplicas(
+        std::vector<Replica::Descriptor>& replica_list) const;
     void NoFBatchEvict(double evict_ratio_target,
                        double evict_ratio_lowerbound);
 
@@ -1446,6 +1479,21 @@ class MasterService {
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
+
+    // LOCAL_DISK warm re-adoption sidecar (in-memory only; never serialized).
+    // local_disk_runtime_      : per-replica liveness state.
+    // local_disk_segment_id_index_ : O(1) lookup for adoption by marker UUID.
+    // client_to_marker_id_     : maps a currently-mounted client_id back to
+    //                            the marker UUID it presented at mount time,
+    //                            so NotifyOffloadSuccess can attach new
+    //                            replicas to the right marker bucket.
+    // All three cleared on Reset() (role transition).
+    mutable std::mutex local_disk_runtime_mutex_;
+    std::unordered_map<ReplicaID, LocalDiskRuntime> local_disk_runtime_;
+    std::unordered_map<UUID, std::vector<ReplicaID>, boost::hash<UUID>>
+        local_disk_segment_id_index_;
+    std::unordered_map<UUID, UUID, boost::hash<UUID>> client_to_marker_id_;
+    const int64_t disconnect_grace_period_sec_;
 
     struct NoFHeartbeatState {
         UUID owner_client_id{0, 0};

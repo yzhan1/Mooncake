@@ -120,6 +120,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      disconnect_grace_period_sec_(config.disconnect_grace_period_sec),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -602,6 +603,29 @@ void MasterService::ClearInvalidHandles(
                 }
                 it = shard->metadata.erase(it);
             } else {
+                // RFC #2306: with warm re-adoption, LOCAL_DISK replicas
+                // survive client expiry as DISCONNECTED. The metadata entry
+                // is NOT erased, so the above promotion_tasks cleanup
+                // doesn't run. We still need to release the promotion slot
+                // (otherwise dead holders pin promotion_in_flight_).
+                auto pt_it = shard->promotion_tasks.find(it->first);
+                if (pt_it != shard->promotion_tasks.end() &&
+                    alive_clients.find(pt_it->second.holder_id) ==
+                        alive_clients.end()) {
+                    // Drop the source LOCAL_DISK replica's refcnt (it was
+                    // inc'd at PromotionAllocStart). If the source is still
+                    // in metadata (now DISCONNECTED), the dec keeps it
+                    // evictable; if not, GetReplicaByID returns null and
+                    // there's nothing to dec.
+                    auto* source =
+                        it->second.GetReplicaByID(pt_it->second.source_id);
+                    if (source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                    shard->promotion_tasks.erase(pt_it);
+                    promotion_in_flight_.fetch_sub(1,
+                                                   std::memory_order_relaxed);
+                }
                 ++it;
             }
         }
@@ -1096,6 +1120,11 @@ auto MasterService::GetReplicaList(const std::string& key)
                 replica_list.emplace_back(replica.get_descriptor());
             });
 
+        // Visibility predicate: hide LOCAL_DISK replicas whose runtime state
+        // is not OK (DISCONNECTED / REMOVED). Owner is unreachable; readers
+        // would RDMA to a dead endpoint. See RFC §3 + §6 (warm re-adoption).
+        FilterDisconnectedLocalDiskReplicas(replica_list);
+
         if (replica_list.empty()) {
             LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
             return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
@@ -1132,6 +1161,28 @@ auto MasterService::GetReplicaList(const std::string& key)
         TryPushPromotionQueue(key);
     }
     return resp;
+}
+
+void MasterService::FilterDisconnectedLocalDiskReplicas(
+    std::vector<Replica::Descriptor>& replica_list) const {
+    std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+    if (local_disk_runtime_.empty()) {
+        return;  // fast path: no LOCAL_DISK runtime tracked at all
+    }
+    auto new_end =
+        std::remove_if(replica_list.begin(), replica_list.end(),
+                       [this](const Replica::Descriptor& desc) {
+                           if (!std::holds_alternative<LocalDiskDescriptor>(
+                                   desc.descriptor_variant)) {
+                               return false;  // not LOCAL_DISK; keep
+                           }
+                           auto it = local_disk_runtime_.find(desc.id);
+                           if (it == local_disk_runtime_.end()) {
+                               return false;  // unknown — default OK; keep
+                           }
+                           return it->second.state != LocalDiskReplicaState::OK;
+                       });
+    replica_list.erase(new_end, replica_list.end());
 }
 
 auto MasterService::AllocateAndInsertMetadata(
@@ -2530,16 +2581,43 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 bool MasterService::CleanupStaleHandles(
     ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-    // Remove those with invalid allocators (memory replicas on unmounted
-    // segments) and local_disk replicas whose owner client is no longer alive.
-    metadata.EraseReplicas([&alive_clients](const Replica& replica) {
+    // RFC: warm re-adoption. LOCAL_DISK replicas of expired clients are
+    // *not* erased; they transition to DISCONNECTED in the sidecar so a
+    // returning client (same local_disk_segment_id) can re-adopt them.
+    // Memory and NoF replicas are still erased as before.
+    //
+    // Step 1: Mark stale LOCAL_DISK replicas as DISCONNECTED in the sidecar.
+    auto grace_expiry = std::chrono::system_clock::now() +
+                        std::chrono::seconds(disconnect_grace_period_sec_);
+    {
+        std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+        metadata.VisitReplicas(
+            [&alive_clients](const Replica& replica) {
+                return replica.has_stale_local_disk_client(alive_clients);
+            },
+            [this, grace_expiry](Replica& replica) {
+                auto& runtime = local_disk_runtime_[replica.id()];
+                if (runtime.state == LocalDiskReplicaState::OK) {
+                    runtime.state = LocalDiskReplicaState::DISCONNECTED;
+                    runtime.grace_expiry = grace_expiry;
+                }
+            });
+    }
+
+    // Step 2: Erase only memory/NoF replicas with invalid handles. LOCAL_DISK
+    // replicas with stale owners are preserved (now hidden via visibility
+    // predicate); reaper sweeps them after grace_expiry passes.
+    metadata.EraseReplicas([](const Replica& replica) {
         return (replica.has_invalid_mem_handle() ||
-                replica.has_invalid_nof_handle() ||
-                replica.has_stale_local_disk_client(alive_clients)) &&
+                replica.has_invalid_nof_handle()) &&
                replica.is_completed();
     });
 
-    // Return true if no valid replicas remain after cleanup
+    // Return true if no valid replicas remain after cleanup. With the new
+    // semantics, a metadata entry whose only durable replica is now a
+    // DISCONNECTED LOCAL_DISK is still considered "valid" (it can be adopted),
+    // so the caller will not erase the key. IsValid() reports based on
+    // replica presence; the visibility predicate filters at read time.
     return !metadata.IsValid();
 }
 
@@ -2614,6 +2692,80 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(err);
     }
     return {};
+}
+
+auto MasterService::MountLocalDiskSegmentWithIdentity(
+    const UUID& client_id, const UUID& local_disk_segment_id,
+    const std::string& transport_endpoint, bool enable_offloading)
+    -> tl::expected<std::pair<MountOutcome, size_t>, ErrorCode> {
+    if (!enable_offload_) {
+        LOG(ERROR) << "The offload functionality is not enabled";
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
+    }
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    // Step 1: regular mount (idempotent). This makes the master aware of the
+    // client_id as a LOCAL_DISK segment owner.
+    auto err =
+        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
+    if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        return tl::make_unexpected(err);
+    }
+
+    // Step 2: record the client→marker mapping so subsequent
+    // NotifyOffloadSuccess calls can populate the sidecar index.
+    std::vector<ReplicaID> to_rebind;
+    {
+        std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+        client_to_marker_id_[client_id] = local_disk_segment_id;
+        auto it = local_disk_segment_id_index_.find(local_disk_segment_id);
+        if (it != local_disk_segment_id_index_.end()) {
+            to_rebind = it->second;  // snapshot for rebind below
+        }
+    }
+    if (to_rebind.empty()) {
+        VLOG(1) << "client_id=" << client_id
+                << ", local_disk_segment_id=" << local_disk_segment_id
+                << ", action=fresh_mount_with_identity";
+        return std::make_pair(MountOutcome::FreshMount, static_cast<size_t>(0));
+    }
+
+    // Step 3: walk replicas in segment_manager_; for each replica whose id
+    // is in to_rebind, flip its LOCAL_DISK owner + transport_endpoint to the
+    // new caller, and update sidecar state to OK. Adoption is rare; the
+    // O(N) walk is acceptable here.
+    std::unordered_set<ReplicaID> rebind_set(to_rebind.begin(),
+                                             to_rebind.end());
+    size_t adopted = 0;
+    for (size_t s = 0; s < kNumShards; ++s) {
+        MetadataShardAccessorRW shard(this, s);
+        for (auto& kv : shard->metadata) {
+            auto& metadata = kv.second;
+            metadata.VisitReplicas(
+                [&rebind_set](const Replica& r) {
+                    return r.is_local_disk_replica() &&
+                           rebind_set.count(r.id()) > 0;
+                },
+                [&](Replica& r) {
+                    r.set_local_disk_owner(client_id, transport_endpoint);
+                    ++adopted;
+                });
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+        for (ReplicaID rid : to_rebind) {
+            auto it = local_disk_runtime_.find(rid);
+            if (it == local_disk_runtime_.end()) continue;
+            it->second.state = LocalDiskReplicaState::OK;
+            it->second.grace_expiry.reset();
+        }
+    }
+    LOG(INFO) << "client_id=" << client_id
+              << ", local_disk_segment_id=" << local_disk_segment_id
+              << ", action=warm_reattach, adopted_replicas=" << adopted;
+    return std::make_pair(MountOutcome::Reattached, adopted);
 }
 
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
@@ -2732,11 +2884,33 @@ auto MasterService::NotifyOffloadSuccess(
         // Add LOCAL_DISK replica.
         Replica replica(client_id, metadata.data_size,
                         metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        const ReplicaID new_replica_id = replica.id();
         auto res = AddReplica(client_id, key, replica);
         if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to add replica: error=" << res.error()
                        << ", client_id=" << client_id << ", key=" << key;
             return tl::make_unexpected(res.error());
+        }
+        // Populate the warm-readoption sidecar for the new LOCAL_DISK replica.
+        // The client must have previously called
+        // MountLocalDiskSegmentWithIdentity for client_to_marker_id_ to have an
+        // entry; if not, fall back to a zero marker (the replica still gets
+        // sidecar state=OK, but can't be adopted later — equivalent to today's
+        // behavior).
+        if (res) {
+            std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+            UUID marker{};
+            auto mit = client_to_marker_id_.find(client_id);
+            if (mit != client_to_marker_id_.end()) {
+                marker = mit->second;
+            }
+            auto& runtime = local_disk_runtime_[new_replica_id];
+            runtime.local_disk_segment_id = marker;
+            runtime.state = LocalDiskReplicaState::OK;
+            runtime.grace_expiry.reset();
+            if (marker.first != 0 || marker.second != 0) {
+                local_disk_segment_id_index_[marker].push_back(new_replica_id);
+            }
         }
     }
     return {};
@@ -4452,6 +4626,15 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
         ok_client_.clear();
     }
+    {
+        // Clear LOCAL_DISK warm re-adoption sidecar on role transition.
+        // State is in-memory only; the new leader rebuilds it as clients
+        // (re-)mount + via seeded client_ttl expiry of dead clients.
+        std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+        local_disk_runtime_.clear();
+        local_disk_segment_id_index_.clear();
+        client_to_marker_id_.clear();
+    }
     PodUUID pod_uuid;
     while (client_ping_queue_.pop(pod_uuid)) {
     }
@@ -4482,12 +4665,41 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
 
-    auto can_evict_replicas = [](const ObjectMetadata& metadata) {
-        return metadata.HasReplica([](const Replica& replica) {
-            return replica.is_memory_replica() && replica.is_completed() &&
-                   replica.get_refcnt() == 0;
-        });
+    // Eviction guard (RFC §6): if the key has any LOCAL_DISK replicas, at
+    // least one of them must currently be OK in the sidecar before we let
+    // the memory copy be evicted. Otherwise, evicting memory while the only
+    // durable replica is DISCONNECTED would leave the key effectively
+    // unreadable (the LOCAL_DISK copy is hidden from readers via the
+    // visibility predicate while DISCONNECTED).
+    auto local_disk_ok_in_sidecar = [this](ReplicaID rid) -> bool {
+        std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+        auto it = local_disk_runtime_.find(rid);
+        if (it == local_disk_runtime_.end()) return true;  // unknown -> OK
+        return it->second.state == LocalDiskReplicaState::OK;
     };
+    auto can_evict_replicas =
+        [this, &local_disk_ok_in_sidecar](const ObjectMetadata& metadata) {
+            const bool has_evictable_mem =
+                metadata.HasReplica([](const Replica& replica) {
+                    return replica.is_memory_replica() &&
+                           replica.is_completed() && replica.get_refcnt() == 0;
+                });
+            if (!has_evictable_mem) return false;
+
+            const bool has_local_disk =
+                metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+            if (!has_local_disk) return true;  // no LOCAL_DISK to worry about
+
+            // Walk LOCAL_DISK replicas; allow eviction only if at least one is
+            // currently OK in the sidecar.
+            bool any_ok = false;
+            metadata.VisitReplicas(
+                &Replica::fn_is_local_disk_replica,
+                [&any_ok, &local_disk_ok_in_sidecar](const Replica& r) {
+                    if (local_disk_ok_in_sidecar(r.id())) any_ok = true;
+                });
+            return any_ok;
+        };
 
     auto evict_replicas = [](ObjectMetadata& metadata) {
         return metadata.EraseReplicas([](const Replica& replica) {
@@ -4915,6 +5127,30 @@ void MasterService::ClientMonitorFunc() {
     std::unordered_map<UUID, std::chrono::steady_clock::time_point,
                        boost::hash<UUID>>
         client_ttl;
+
+    // Seeded client_ttl: pre-populate from segment_manager_ at startup so
+    // clients that were live when the snapshot was taken but never re-ping
+    // on this leader (i.e., dead-pre-failover) eventually expire via the
+    // normal expiry path. Without this, dead-client replicas remain stuck
+    // visible to readers forever on a new leader. See RFC §6 + the
+    // SeededClientTtlClosesFailoverLeak test.
+    {
+        const auto seed_now = std::chrono::steady_clock::now();
+        const auto seed_deadline =
+            seed_now + std::chrono::seconds(client_live_ttl_sec_);
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        std::vector<UUID> seeded_ids;
+        segment_access.GetAllClientIds(seeded_ids);
+        for (const auto& cid : seeded_ids) {
+            client_ttl.emplace(cid, seed_deadline);
+        }
+        VLOG(1) << "action=seed_client_ttl, count=" << seeded_ids.size()
+                << ", deadline_sec=" << client_live_ttl_sec_;
+    }
+
     while (client_monitor_running_) {
         auto now = std::chrono::steady_clock::now();
 
@@ -5013,6 +5249,51 @@ void MasterService::ClientMonitorFunc() {
                 for (auto& client_id : expired_clients) {
                     segment_access.UnmountLocalDiskSegment(client_id);
                 }
+            }
+        }
+
+        // Reaper: sweep DISCONNECTED LOCAL_DISK replicas whose grace_expiry
+        // has passed. Erases their sidecar entry and removes them from any
+        // index. The actual replica metadata is left in place for now (it's
+        // hidden from readers via the visibility predicate); a future PR can
+        // also delete the per-key metadata entry. See RFC §6 + #8.
+        {
+            const auto reap_now = std::chrono::system_clock::now();
+            std::vector<ReplicaID> reaped;
+            std::vector<UUID> index_keys_to_check;
+            {
+                std::lock_guard<std::mutex> lock(local_disk_runtime_mutex_);
+                for (auto it = local_disk_runtime_.begin();
+                     it != local_disk_runtime_.end();) {
+                    const auto& runtime = it->second;
+                    if (runtime.state == LocalDiskReplicaState::DISCONNECTED &&
+                        runtime.grace_expiry.has_value() &&
+                        runtime.grace_expiry.value() < reap_now) {
+                        reaped.push_back(it->first);
+                        index_keys_to_check.push_back(
+                            runtime.local_disk_segment_id);
+                        it = local_disk_runtime_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                // Prune reaped ReplicaIDs from the marker index.
+                for (size_t i = 0; i < index_keys_to_check.size(); ++i) {
+                    const UUID& marker = index_keys_to_check[i];
+                    if (marker.first == 0 && marker.second == 0) continue;
+                    auto idx_it = local_disk_segment_id_index_.find(marker);
+                    if (idx_it == local_disk_segment_id_index_.end()) continue;
+                    auto& vec = idx_it->second;
+                    vec.erase(std::remove(vec.begin(), vec.end(), reaped[i]),
+                              vec.end());
+                    if (vec.empty()) {
+                        local_disk_segment_id_index_.erase(idx_it);
+                    }
+                }
+            }
+            if (!reaped.empty()) {
+                VLOG(1) << "action=reap_disconnected_local_disk_replicas"
+                        << ", count=" << reaped.size();
             }
         }
 

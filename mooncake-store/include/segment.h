@@ -163,6 +163,13 @@ class ScopedSegmentAccess {
                                 std::vector<Segment>& segments) const;
 
     /**
+     * @brief Get all distinct client_ids that currently own segments.
+     * Used by ClientMonitorFunc at startup to seed client_ttl from
+     * snapshot-restored state.
+     */
+    void GetAllClientIds(std::vector<UUID>& client_ids) const;
+
+    /**
      * @brief Get the names of all the segments
      */
     ErrorCode GetAllSegments(std::vector<std::string>& all_segments);

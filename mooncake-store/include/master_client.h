@@ -396,6 +396,20 @@ class MasterClient {
         const UUID& client_id, bool enable_offloading);
 
     /**
+     * @brief Warm re-adoption mount that presents the persistent
+     * local_disk_segment_id from the client's marker file. If a matching
+     * marker is found on the master, prior replicas are atomically re-bound
+     * to (client_id, transport_endpoint). See RFC §5.
+     * @return {outcome_byte, adopted_count} on success; outcome_byte is
+     *         0 (FreshMount) or 1 (Reattached).
+     */
+    [[nodiscard]] tl::expected<std::pair<uint8_t, uint64_t>, ErrorCode>
+    MountLocalDiskSegmentWithIdentity(const UUID& client_id,
+                                      const UUID& local_disk_segment_id,
+                                      const std::string& transport_endpoint,
+                                      bool enable_offloading);
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-persisted objects.
      * @param enable_offloading Indicates whether persistence is enabled for

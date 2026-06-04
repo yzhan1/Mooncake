@@ -164,6 +164,15 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
+    // Warm re-adoption mount: client passes persistent local_disk_segment_id
+    // read from its marker file (RFC §5). Returns {outcome_byte,
+    // adopted_count} where outcome_byte is FreshMount=0 / Reattached=1.
+    tl::expected<std::pair<uint8_t, uint64_t>, ErrorCode>
+    MountLocalDiskSegmentWithIdentity(const UUID& client_id,
+                                      const UUID& local_disk_segment_id,
+                                      const std::string& transport_endpoint,
+                                      bool enable_offloading);
+
     tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 

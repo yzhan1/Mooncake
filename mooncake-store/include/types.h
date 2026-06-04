@@ -93,6 +93,10 @@ static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_DISCONNECT_GRACE_PERIOD_SEC =
+    600;  // RFC #2306: how long a DISCONNECTED LOCAL_DISK replica is held
+          // before the reaper removes it. Distinct from grace_period_ms on
+          // UnmountSegmentById (cooperative shutdown).
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
